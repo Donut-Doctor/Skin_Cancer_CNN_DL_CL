@@ -330,9 +330,3 @@ Expected: `{ "status": "ok", "model_loaded": true }`
 - Intended only as a preliminary screening and decision-support tool
 
 
----
-
-**DR. B.C ROY ENGINEERING COLLEGE, DURGAPUR**
-Department of Master of Computer Applications | 2024–2026
-Suman Pal (120710242086) | Soumyajit Karmakar (120710242073)
-Guide: Prof. Biswesar Ghosh
