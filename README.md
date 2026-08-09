@@ -38,7 +38,7 @@ An AI-powered web application that classifies dermoscopic skin lesion images int
 | Data Processing | NumPy 1.26, Pandas |
 | ML Utilities | scikit-learn |
 | Backend Framework | Flask 3.0, Flask-CORS |
-| Frontend | Vanilla JavaScript, HTML5, CSS3 |
+| Frontend | JavaScript, HTML5, CSS3 |
 | Training Platform | Kaggle (Tesla P100 GPU, 16GB VRAM) |
 | Database | None — model loaded into memory at runtime |
 
