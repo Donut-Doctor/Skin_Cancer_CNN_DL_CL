@@ -1,1 +1,459 @@
-{"metadata":{"kernelspec":{"display_name":"Python 3","language":"python","name":"python3"},"language_info":{"name":"python","version":"3.12.13","mimetype":"text/x-python","codemirror_mode":{"name":"ipython","version":3},"pygments_lexer":"ipython3","nbconvert_exporter":"python","file_extension":".py"},"kaggle":{"accelerator":"gpu","dataSources":[{"sourceType":"datasetVersion","sourceId":104884}],"isInternetEnabled":true,"language":"python","sourceType":"notebook","isGpuEnabled":true}},"nbformat_minor":4,"nbformat":4,"cells":[{"source":"<a href=\"https://www.kaggle.com/code/sumanpal03/skin-cancer-cnn-dl-cl?scriptVersionId=340811854\" target=\"_blank\"><img align=\"left\" alt=\"Kaggle\" title=\"Open in Kaggle\" src=\"https://kaggle.com/static/images/open-in-kaggle.svg\"></a>","metadata":{},"cell_type":"markdown"},{"cell_type":"markdown","source":"# Skin Cancer Detection\n**DR. BC ROY ENGINEERING COLLEGE, DURGAPUR | MCA | Major Project CA-482**\n\nSuman Pal\n","metadata":{}},{"cell_type":"code","source":"%matplotlib inline\nimport os, itertools, warnings, cv2\nwarnings.filterwarnings('ignore')\nimport numpy as np\nimport pandas as pd\nimport matplotlib.pyplot as plt\nfrom glob import glob\nfrom PIL import Image\nfrom multiprocessing.pool import ThreadPool\nnp.random.seed(42)\n\nimport tensorflow as tf\nprint('TensorFlow:', tf.__version__)\nprint('GPUs:', tf.config.list_physical_devices('GPU'))\n\nfrom tensorflow.keras.utils import to_categorical\nfrom tensorflow.keras.models import Model\nfrom tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, BatchNormalization\nfrom tensorflow.keras.applications import ResNet50V2\nfrom tensorflow.keras.applications.resnet_v2 import preprocess_input\nfrom tensorflow.keras.optimizers import Adam\nfrom tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint\nfrom tensorflow.keras.regularizers import l2\nfrom sklearn.model_selection import train_test_split\nfrom sklearn.utils.class_weight import compute_class_weight\nfrom sklearn.metrics import confusion_matrix, classification_report\nprint('All imports OK.')\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:00:51.992994Z","iopub.execute_input":"2026-05-20T06:00:51.993296Z","iopub.status.idle":"2026-05-20T06:01:19.537698Z","shell.execute_reply.started":"2026-05-20T06:00:51.993259Z","shell.execute_reply":"2026-05-20T06:01:19.536896Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 1 — Load Dataset","metadata":{}},{"cell_type":"code","source":"base_dir = os.path.join('..', 'input')\nimageid_path_dict = {\n    os.path.splitext(os.path.basename(x))[0]: x\n    for x in glob(os.path.join(base_dir, '*', '*.jpg'))\n}\nprint('Total images found:', len(imageid_path_dict))\n\nlesion_type_dict = {\n    'nv':    'Melanocytic nevi',\n    'mel':   'Melanoma',\n    'bkl':   'Benign keratosis-like lesions',\n    'bcc':   'Basal cell carcinoma',\n    'akiec': 'Actinic keratoses',\n    'vasc':  'Vascular lesions',\n    'df':    'Dermatofibroma'\n}\n\nskin_df = pd.read_csv(os.path.join(base_dir, 'HAM10000_metadata.csv'))\nskin_df['path']          = skin_df['image_id'].map(imageid_path_dict.get)\nskin_df['cell_type']     = skin_df['dx'].map(lesion_type_dict.get)\nskin_df['cell_type_idx'] = pd.Categorical(skin_df['cell_type']).codes\nskin_df['age'].fillna(skin_df['age'].mean(), inplace=True)\nprint('Class distribution:')\nprint(skin_df['cell_type'].value_counts())\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:01:19.539315Z","iopub.execute_input":"2026-05-20T06:01:19.539736Z","iopub.status.idle":"2026-05-20T06:01:20.122783Z","shell.execute_reply.started":"2026-05-20T06:01:19.539711Z","shell.execute_reply":"2026-05-20T06:01:20.121816Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 2 — EDA","metadata":{}},{"cell_type":"code","source":"fig, axes = plt.subplots(1, 2, figsize=(14, 4))\ncolors = ['#e74c3c' if c in ['Melanoma','Basal cell carcinoma','Actinic keratoses']\n          else '#f39c12' if c == 'Vascular lesions' else '#2ecc71'\n          for c in skin_df['cell_type'].value_counts().index]\nskin_df['cell_type'].value_counts().plot(kind='bar', ax=axes[0], color=colors, edgecolor='white')\naxes[0].set_title('Class Distribution (Red=High Risk)')\naxes[0].tick_params(axis='x', rotation=35)\nskin_df['age'].hist(bins=40, ax=axes[1], color='steelblue', edgecolor='white')\naxes[1].set_title('Age Distribution')\nplt.tight_layout(); plt.savefig('eda.png', dpi=120); plt.show()\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:01:20.123972Z","iopub.execute_input":"2026-05-20T06:01:20.124329Z","iopub.status.idle":"2026-05-20T06:01:20.72801Z","shell.execute_reply.started":"2026-05-20T06:01:20.124296Z","shell.execute_reply":"2026-05-20T06:01:20.727294Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 3 — Preprocessing (Hair Removal + CLAHE)","metadata":{}},{"cell_type":"code","source":"IMG_SIZE = 224\n\ndef remove_hair(img):\n    try:\n        gray   = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)\n        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))\n        bhat   = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)\n        _, th  = cv2.threshold(bhat, 10, 255, cv2.THRESH_BINARY)\n        return cv2.inpaint(img, th, 1, cv2.INPAINT_TELEA)\n    except: return img\n\ndef apply_clahe(img):\n    try:\n        lab     = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)\n        l, a, b = cv2.split(lab)\n        clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))\n        return cv2.cvtColor(cv2.merge([clahe.apply(l), a, b]), cv2.COLOR_LAB2RGB)\n    except: return img\n\ndef load_and_preprocess(path):\n    try:\n        img = np.asarray(Image.open(path).resize((IMG_SIZE, IMG_SIZE)).convert('RGB'))\n        return apply_clahe(remove_hair(img))\n    except: return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)\n\nsample_paths = skin_df['path'].sample(3, random_state=42).tolist()\nfig, axes = plt.subplots(3, 3, figsize=(10, 10))\nfor i, path in enumerate(sample_paths):\n    raw = np.asarray(Image.open(path).resize((IMG_SIZE, IMG_SIZE)).convert('RGB'))\n    for ax, im, t in zip(axes[i],\n                         [raw, remove_hair(raw), apply_clahe(remove_hair(raw))],\n                         ['Original', 'Hair Removed', 'CLAHE']):\n        ax.imshow(im); ax.set_title(t, fontsize=9); ax.axis('off')\nplt.suptitle('Preprocessing Pipeline', fontsize=12, fontweight='bold')\nplt.tight_layout(); plt.savefig('preprocessing.png', dpi=120); plt.show()\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:01:20.728865Z","iopub.execute_input":"2026-05-20T06:01:20.729263Z","iopub.status.idle":"2026-05-20T06:01:22.870745Z","shell.execute_reply.started":"2026-05-20T06:01:20.72924Z","shell.execute_reply":"2026-05-20T06:01:22.869814Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 4 — Load All Images","metadata":{}},{"cell_type":"code","source":"print('Loading {} images with 8 threads...'.format(len(skin_df)))\nwith ThreadPool(8) as pool:\n    images = pool.map(load_and_preprocess, skin_df['path'].tolist())\nskin_df['image'] = images\nprint('Done! Shape:', skin_df['image'].iloc[0].shape)\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:01:22.871783Z","iopub.execute_input":"2026-05-20T06:01:22.872159Z","iopub.status.idle":"2026-05-20T06:02:30.104833Z","shell.execute_reply.started":"2026-05-20T06:01:22.872135Z","shell.execute_reply":"2026-05-20T06:02:30.104002Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 5 — Oversample Minority Classes\n> Increased target to 1500 for worst-performing classes (vasc, bkl, akiec).","metadata":{}},{"cell_type":"code","source":"# Boosted targets based on v5 classification report\n# Vascular lesions F1=0.56 → boost to 2000\n# BKL F1=0.78, Melanoma F1=0.88 → boost to 1500\nboost_2000 = ['Vascular lesions']\nboost_1500 = ['Benign keratosis-like lesions', 'Melanoma']\n\nbalanced = []\nfor idx in sorted(skin_df['cell_type_idx'].unique()):\n    sub  = skin_df[skin_df['cell_type_idx'] == idx]\n    n    = len(sub)\n    name = sub['cell_type'].iloc[0]\n    if name in boost_2000:\n        target = 2000\n    elif name in boost_1500:\n        target = 1500\n    else:\n        target = 1000\n    if n < target:\n        times  = target // n\n        remain = target % n\n        over   = pd.concat([sub]*times + [sub.sample(remain, random_state=42)],\n                           ignore_index=True)\n        balanced.append(over)\n        print('Class {:d} ({:<35s}): {:4d} -> {:4d}'.format(idx, name, n, len(over)))\n    else:\n        balanced.append(sub)\n        print('Class {:d} ({:<35s}): {:4d} (unchanged)'.format(idx, name, n))\n\nskin_df_bal = pd.concat(balanced, ignore_index=True).sample(frac=1, random_state=42)\nprint('\\nBalanced total:', len(skin_df_bal))\nprint(skin_df_bal['cell_type'].value_counts())\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:02:30.10603Z","iopub.execute_input":"2026-05-20T06:02:30.106451Z","iopub.status.idle":"2026-05-20T06:02:30.139799Z","shell.execute_reply.started":"2026-05-20T06:02:30.106388Z","shell.execute_reply":"2026-05-20T06:02:30.13914Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 6 — Split & Normalize","metadata":{}},{"cell_type":"code","source":"features = skin_df_bal.drop(columns=['cell_type_idx'])\ntarget   = skin_df_bal['cell_type_idx']\n\nx_tr_o, x_test_o, y_tr_o, y_test_o = train_test_split(\n    features, target, test_size=0.20, random_state=42, stratify=target\n)\nx_train_raw = np.asarray(x_tr_o['image'].tolist()).astype('float32')\nx_test_raw  = np.asarray(x_test_o['image'].tolist()).astype('float32')\ny_train     = to_categorical(y_tr_o,   num_classes=7)\ny_test      = to_categorical(y_test_o, num_classes=7)\n\nx_train_raw, x_val_raw, y_train, y_validate = train_test_split(\n    x_train_raw, y_train, test_size=0.10, random_state=42\n)\n\nx_val_scaled  = preprocess_input(x_val_raw.copy())\nx_test_scaled = preprocess_input(x_test_raw.copy())\n\nprint('Train    :', x_train_raw.shape)\nprint('Validate :', x_val_raw.shape)\nprint('Test     :', x_test_raw.shape)\nprint('Val range: [{:.1f}, {:.1f}]'.format(x_val_scaled.min(), x_val_scaled.max()))\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:02:30.141965Z","iopub.execute_input":"2026-05-20T06:02:30.142263Z","iopub.status.idle":"2026-05-20T06:02:36.394655Z","shell.execute_reply.started":"2026-05-20T06:02:30.14224Z","shell.execute_reply":"2026-05-20T06:02:36.393964Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 7 — Class Weights","metadata":{}},{"cell_type":"code","source":"cw = compute_class_weight('balanced', classes=np.unique(y_tr_o), y=y_tr_o)\nclass_weight_dict = dict(enumerate(cw))\nprint('Class weights:')\nfor k, v in class_weight_dict.items():\n    print('  [{:d}] {:<35s}: {:.4f}'.format(k, list(lesion_type_dict.values())[k], v))\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:02:36.395639Z","iopub.execute_input":"2026-05-20T06:02:36.39643Z","iopub.status.idle":"2026-05-20T06:02:36.405628Z","shell.execute_reply.started":"2026-05-20T06:02:36.396404Z","shell.execute_reply":"2026-05-20T06:02:36.404792Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 8 — tf.data Pipeline with .repeat()","metadata":{}},{"cell_type":"code","source":"BATCH_SIZE = 32\nAUTOTUNE   = tf.data.AUTOTUNE\n\n@tf.function\ndef augment_fn(image, label):\n    image = tf.cast(image, tf.float32)\n    image = (image / 127.5) - 1.0          # ResNet50V2 normalization\n    image = tf.image.random_flip_left_right(image)\n    image = tf.image.random_flip_up_down(image)\n    k     = tf.random.uniform([], 0, 4, dtype=tf.int32)\n    image = tf.image.rot90(image, k=k)\n    image = tf.image.random_brightness(image, max_delta=0.15)\n    image = tf.image.random_contrast(image, lower=0.85, upper=1.15)\n    image = tf.clip_by_value(image, -1.0, 1.0)\n    return image, label\n\n# .repeat() + steps_per_epoch = guaranteed full epoch every time\ntrain_ds = (\n    tf.data.Dataset.from_tensor_slices((x_train_raw, y_train))\n    .shuffle(buffer_size=len(x_train_raw), seed=42, reshuffle_each_iteration=True)\n    .map(augment_fn, num_parallel_calls=AUTOTUNE)\n    .batch(BATCH_SIZE)\n    .repeat()                               # KEY FIX: never exhausts\n    .prefetch(AUTOTUNE)\n)\n\nSTEPS = len(x_train_raw) // BATCH_SIZE\nprint('Pipeline ready with .repeat() — no more alternating epoch bug')\nprint('Steps per epoch :', STEPS)\nprint('Total train imgs:', len(x_train_raw))\n\nfor imgs, labels in train_ds.take(1):\n    print('Batch shape     :', imgs.shape)\n    print('Pixel range     : [{:.2f}, {:.2f}]'.format(\n        float(tf.reduce_min(imgs)), float(tf.reduce_max(imgs))))\nprint('Pipeline verified OK.')\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:02:36.406758Z","iopub.execute_input":"2026-05-20T06:02:36.407148Z","iopub.status.idle":"2026-05-20T06:02:58.002208Z","shell.execute_reply.started":"2026-05-20T06:02:36.407097Z","shell.execute_reply":"2026-05-20T06:02:58.001356Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 9 — Build Model (ResNet50V2)","metadata":{}},{"cell_type":"code","source":"NUM_CLASSES = 7\nINPUT_SHAPE = (IMG_SIZE, IMG_SIZE, 3)\n\nbase_model = ResNet50V2(\n    weights='imagenet', include_top=False, input_shape=INPUT_SHAPE\n)\nbase_model.trainable = False\n\n# Increased dropout to reduce overfitting (v5 had 8.7% train-val gap)\nx      = base_model.output\nx      = GlobalAveragePooling2D()(x)\nx      = BatchNormalization()(x)\nx      = Dropout(0.6)(x)  # increased from 0.5\nx      = Dense(512, activation='relu', kernel_regularizer=l2(2e-4))(x)  # stronger L2\nx      = BatchNormalization()(x)\nx      = Dropout(0.5)(x)  # increased from 0.4\nx      = Dense(256, activation='relu', kernel_regularizer=l2(2e-4))(x)\nx      = BatchNormalization()(x)\nx      = Dropout(0.4)(x)  # increased from 0.3\noutput = Dense(NUM_CLASSES, activation='softmax')(x)\n\nmodel = Model(inputs=base_model.input, outputs=output)\n\ntotal     = int(np.sum([np.prod(w.shape) for w in model.weights]))\ntrainable = int(np.sum([np.prod(w.shape) for w in model.trainable_weights]))\nprint('Backbone     : ResNet50V2 (ImageNet)')\nprint('Dropout      : 0.6 / 0.5 / 0.4  (increased to fight overfitting)')\nprint('L2 reg       : 2e-4 (stronger than v5)')\nprint('Total params : {:,}'.format(total))\nprint('Trainable    : {:,} (head only — Phase 1)'.format(trainable))\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:02:58.003262Z","iopub.execute_input":"2026-05-20T06:02:58.003556Z","iopub.status.idle":"2026-05-20T06:03:00.711842Z","shell.execute_reply.started":"2026-05-20T06:02:58.003534Z","shell.execute_reply":"2026-05-20T06:03:00.711195Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 10 — Callbacks","metadata":{}},{"cell_type":"code","source":"def get_callbacks(path, patience_es=12, patience_lr=5):\n    return [\n        EarlyStopping(\n            monitor='val_accuracy', patience=patience_es,\n            restore_best_weights=True, mode='max', verbose=1\n        ),\n        ReduceLROnPlateau(\n            monitor='val_loss', factor=0.5,\n            patience=patience_lr, min_lr=1e-9, verbose=1\n        ),\n        ModelCheckpoint(\n            path, monitor='val_accuracy',\n            save_best_only=True, mode='max', verbose=1\n        )\n    ]\nprint('Callbacks ready.')\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:03:00.712673Z","iopub.execute_input":"2026-05-20T06:03:00.713015Z","iopub.status.idle":"2026-05-20T06:03:00.718064Z","shell.execute_reply.started":"2026-05-20T06:03:00.712984Z","shell.execute_reply":"2026-05-20T06:03:00.717304Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 11 — Phase 1: Train Head (30 Epochs)\n> All epochs should take equal time now — .repeat() fixes the alternating bug.","metadata":{}},{"cell_type":"code","source":"model.compile(\n    optimizer=Adam(learning_rate=1e-3),\n    loss='categorical_crossentropy',\n    metrics=['accuracy']\n)\n\nprint('=' * 60)\nprint('PHASE 1 — Head only (ResNet50V2 frozen)')\nprint('Epochs: 30 | LR: 1e-3 | Steps/epoch:', STEPS)\nprint('All epochs should take same duration with .repeat()')\nprint('=' * 60)\n\nhistory1 = model.fit(\n    train_ds,\n    epochs=30,\n    steps_per_epoch=STEPS,\n    validation_data=(x_val_scaled, y_validate),\n    class_weight=class_weight_dict,\n    callbacks=get_callbacks('best_model_p1.keras', patience_es=10, patience_lr=4),\n    verbose=1\n)\n\nk     = 'val_accuracy' if 'val_accuracy' in history1.history else 'val_acc'\nbest1 = max(history1.history[k])\nprint('\\nPhase 1 best val_accuracy: {:.2f}%'.format(best1 * 100))\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:03:00.719014Z","iopub.execute_input":"2026-05-20T06:03:00.719305Z","iopub.status.idle":"2026-05-20T06:11:47.561016Z","shell.execute_reply.started":"2026-05-20T06:03:00.719283Z","shell.execute_reply":"2026-05-20T06:11:47.560083Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 12 — Phase 2: Fine-Tune (100 Epochs, Patience=15)\n> v4 was still improving at epoch 50. Extended to 100 with higher patience.","metadata":{}},{"cell_type":"code","source":"base_model.trainable = True\nfreeze_until = int(len(base_model.layers) * 0.4)\nfor layer in base_model.layers[:freeze_until]:\n    layer.trainable = False\nfor layer in base_model.layers[freeze_until:]:\n    layer.trainable = True\n\ntrainable = int(np.sum([np.prod(w.shape) for w in model.trainable_weights]))\nprint('Frozen until layer : {} / {}'.format(freeze_until, len(base_model.layers)))\nprint('Trainable params   : {:,}'.format(trainable))\n\nmodel.compile(\n    optimizer=Adam(learning_rate=1e-5, weight_decay=1e-4),\n    loss='categorical_crossentropy',\n    metrics=['accuracy']\n)\n\nprint('=' * 60)\nprint('PHASE 2 — Fine-tuning (top 60% of ResNet50V2 unfrozen)')\nprint('Epochs: 100 | LR: 1e-5 | Steps/epoch:', STEPS)\nprint('EarlyStopping patience=15 — will stop when truly converged')\nprint('=' * 60)\n\nhistory2 = model.fit(\n    train_ds,\n    epochs=100,\n    steps_per_epoch=STEPS,\n    validation_data=(x_val_scaled, y_validate),\n    class_weight=class_weight_dict,\n    callbacks=get_callbacks('best_model.keras', patience_es=15, patience_lr=6),\n    verbose=1\n)\n\nk     = 'val_accuracy' if 'val_accuracy' in history2.history else 'val_acc'\nbest2 = max(history2.history[k])\nprint('\\nPhase 2 best val_accuracy: {:.2f}%'.format(best2 * 100))\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T06:11:47.562243Z","iopub.execute_input":"2026-05-20T06:11:47.562563Z","iopub.status.idle":"2026-05-20T07:00:39.824098Z","shell.execute_reply.started":"2026-05-20T06:11:47.562538Z","shell.execute_reply":"2026-05-20T07:00:39.823351Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 13 — Training Curves","metadata":{}},{"cell_type":"code","source":"def g(h, key):\n    alt = key.replace('accuracy','acc').replace('val_accuracy','val_acc')\n    return h.history.get(key, h.history.get(alt, []))\n\nacc      = g(history1,'accuracy')     + g(history2,'accuracy')\nval_acc  = g(history1,'val_accuracy') + g(history2,'val_accuracy')\nloss     = g(history1,'loss')         + g(history2,'loss')\nval_loss = g(history1,'val_loss')     + g(history2,'val_loss')\nep       = range(1, len(acc)+1)\np1_end   = len(g(history1,'loss'))\n\nfig, axs = plt.subplots(1, 2, figsize=(15, 5))\nfor ax, tv, vv, title in zip(axs,\n    [acc, loss], [val_acc, val_loss], ['Accuracy','Loss']):\n    ax.plot(ep, tv, label='Train',      color='#2196F3')\n    ax.plot(ep, vv, label='Validation', color='#4CAF50')\n    ax.axvline(p1_end, color='gray', linestyle='--', linewidth=1.5, label='Phase 2 start')\n    ax.set_title(title); ax.set_xlabel('Epoch')\n    ax.legend(); ax.grid(alpha=0.3)\nplt.suptitle('Training History — Phase 1 + Phase 2', fontsize=13, fontweight='bold')\nplt.tight_layout()\nplt.savefig('training_curves.png', dpi=150)\nplt.show()\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T07:00:39.825315Z","iopub.execute_input":"2026-05-20T07:00:39.825629Z","iopub.status.idle":"2026-05-20T07:00:40.485549Z","shell.execute_reply.started":"2026-05-20T07:00:39.825596Z","shell.execute_reply":"2026-05-20T07:00:40.484916Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 14 — Final Evaluation","metadata":{}},{"cell_type":"code","source":"_, acc_v = model.evaluate(x_val_scaled,  y_validate, verbose=0)\n_, acc_t = model.evaluate(x_test_scaled, y_test,     verbose=0)\n\nprint('\\n' + '=' * 60)\nprint('FINAL RESULTS')\nprint('=' * 60)\nprint('Validation Accuracy : {:.2f}%'.format(acc_v * 100))\nprint('Test Accuracy       : {:.2f}%'.format(acc_t * 100))\nprint('=' * 60)\nif acc_t >= 0.90:\n    print('TARGET MET: Above 90%!')\nelif acc_t >= 0.85:\n    print('Close to target — above 85%')\nelse:\n    print('Share logs — will diagnose further.')\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T07:00:40.486589Z","iopub.execute_input":"2026-05-20T07:00:40.487009Z","iopub.status.idle":"2026-05-20T07:00:57.583795Z","shell.execute_reply.started":"2026-05-20T07:00:40.486979Z","shell.execute_reply":"2026-05-20T07:00:57.583116Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 15 — Confusion Matrix","metadata":{}},{"cell_type":"code","source":"Y_pred   = model.predict(x_val_scaled, verbose=0)\nY_pred_c = np.argmax(Y_pred,    axis=1)\nY_true   = np.argmax(y_validate, axis=1)\n\nclass_labels = list(lesion_type_dict.values())\ncm      = confusion_matrix(Y_true, Y_pred_c)\ncm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]\n\nfig, axes = plt.subplots(1, 2, figsize=(20, 8))\nfor ax, data, fmt, title in zip(\n    axes, [cm, cm_norm], ['d','.2f'],\n    ['Confusion Matrix (Counts)','Confusion Matrix (Normalized)']):\n    im = ax.imshow(data, interpolation='nearest', cmap=plt.cm.Blues)\n    ax.set_title(title, fontsize=12); plt.colorbar(im, ax=ax)\n    ticks = np.arange(len(class_labels))\n    ax.set_xticks(ticks); ax.set_xticklabels(class_labels, rotation=40, ha='right', fontsize=8)\n    ax.set_yticks(ticks); ax.set_yticklabels(class_labels, fontsize=8)\n    thresh = data.max() / 2.\n    for i, j in itertools.product(range(data.shape[0]), range(data.shape[1])):\n        ax.text(j, i, format(data[i,j], fmt), ha='center',\n                color='white' if data[i,j] > thresh else 'black', fontsize=8)\n    ax.set_ylabel('True'); ax.set_xlabel('Predicted')\nplt.tight_layout()\nplt.savefig('confusion_matrix.png', dpi=150)\nplt.show()\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T07:00:57.584718Z","iopub.execute_input":"2026-05-20T07:00:57.585178Z","iopub.status.idle":"2026-05-20T07:01:09.088119Z","shell.execute_reply.started":"2026-05-20T07:00:57.585154Z","shell.execute_reply":"2026-05-20T07:01:09.086925Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 16 — Classification Report","metadata":{}},{"cell_type":"code","source":"print(classification_report(Y_true, Y_pred_c, target_names=class_labels, digits=4))\n\nerr = 1 - np.diag(cm) / np.sum(cm, axis=1)\ncolors_b = ['#e74c3c' if e > 0.2 else '#f39c12' if e > 0.1 else '#2ecc71' for e in err]\nplt.figure(figsize=(11, 4))\nbars = plt.bar(class_labels, err, color=colors_b, edgecolor='white')\nplt.xticks(rotation=30, ha='right')\nplt.ylabel('Fraction Misclassified')\nplt.title('Per-Class Error Rate (Red>20%, Orange>10%, Green<=10%)')\nfor bar, val in zip(bars, err):\n    plt.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005,\n             '{:.1%}'.format(val), ha='center', fontsize=9)\nplt.tight_layout()\nplt.savefig('per_class_error.png', dpi=150)\nplt.show()\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T07:01:09.089488Z","iopub.execute_input":"2026-05-20T07:01:09.089846Z","iopub.status.idle":"2026-05-20T07:01:09.426241Z","shell.execute_reply.started":"2026-05-20T07:01:09.089802Z","shell.execute_reply":"2026-05-20T07:01:09.425584Z"}},"outputs":[],"execution_count":null},{"cell_type":"markdown","source":"## Step 17 — Save for Deployment","metadata":{}},{"cell_type":"code","source":"import json\nmodel.save('skin_cancer_model.keras')\nprint('Saved: skin_cancer_model.keras')\n\nclass_info = {\n    str(i): {\n        'name': list(lesion_type_dict.values())[i],\n        'code': list(lesion_type_dict.keys())[i],\n        'risk': 'High'   if list(lesion_type_dict.keys())[i] in ['mel','bcc','akiec']\n               else 'Medium' if list(lesion_type_dict.keys())[i] == 'vasc'\n               else 'Low'\n    }\n    for i in range(7)\n}\nwith open('class_info.json', 'w') as f:\n    json.dump(class_info, f, indent=2)\nprint('Saved: class_info.json')\n\nconfig = {\n    'img_size': IMG_SIZE,\n    'num_classes': 7,\n    'backbone': 'ResNet50V2',\n    'normalization': '(image/127.5)-1.0',\n    'preprocessing': ['hair_removal', 'clahe']\n}\nwith open('model_config.json', 'w') as f:\n    json.dump(config, f, indent=2)\nprint('Saved: model_config.json')\n\nprint('\\n' + '=' * 60)\nprint('TEST ACCURACY  : {:.2f}%'.format(acc_t * 100))\nprint('VAL  ACCURACY  : {:.2f}%'.format(acc_v * 100))\nprint('BACKBONE       : ResNet50V2')\nprint('PIPELINE       : tf.data with .repeat() — no epoch bug')\nprint('NORMALIZATION  : (image/127.5)-1.0')\nprint('BALANCING      : Oversampling (weak classes → 1500) + weights')\nprint('PREPROCESSING  : CLAHE + Hair removal')\nprint('=' * 60)\nprint('\\nDownload from Kaggle Output tab:')\nprint('  skin_cancer_model.keras  class_info.json  model_config.json')\n","metadata":{"trusted":true,"execution":{"iopub.status.busy":"2026-05-20T07:01:09.427234Z","iopub.execute_input":"2026-05-20T07:01:09.427578Z","iopub.status.idle":"2026-05-20T07:01:11.100123Z","shell.execute_reply.started":"2026-05-20T07:01:09.427555Z","shell.execute_reply":"2026-05-20T07:01:11.099394Z"}},"outputs":[],"execution_count":null}]}
+# Skin Cancer Detection
+
+%matplotlib inline
+import os, itertools, warnings, cv2
+warnings.filterwarnings('ignore')
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from glob import glob
+from PIL import Image
+from multiprocessing.pool import ThreadPool
+np.random.seed(42)
+
+import tensorflow as tf
+print('TensorFlow:', tf.__version__)
+print('GPUs:', tf.config.list_physical_devices('GPU'))
+
+from tensorflow.keras.utils import to_categorical
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, Dropout, GlobalAveragePooling2D, BatchNormalization
+from tensorflow.keras.applications import ResNet50V2
+from tensorflow.keras.applications.resnet_v2 import preprocess_input
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ReduceLROnPlateau, EarlyStopping, ModelCheckpoint
+from tensorflow.keras.regularizers import l2
+from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report
+print('All imports OK.')
+
+## Step 1 — Load Dataset
+base_dir = os.path.join('..', 'input')
+imageid_path_dict = {
+    os.path.splitext(os.path.basename(x))[0]: x
+    for x in glob(os.path.join(base_dir, '*', '*.jpg'))
+}
+print('Total images found:', len(imageid_path_dict))
+
+lesion_type_dict = {
+    'nv':    'Melanocytic nevi',
+    'mel':   'Melanoma',
+    'bkl':   'Benign keratosis-like lesions',
+    'bcc':   'Basal cell carcinoma',
+    'akiec': 'Actinic keratoses',
+    'vasc':  'Vascular lesions',
+    'df':    'Dermatofibroma'
+}
+
+skin_df = pd.read_csv(os.path.join(base_dir, 'HAM10000_metadata.csv'))
+skin_df['path']          = skin_df['image_id'].map(imageid_path_dict.get)
+skin_df['cell_type']     = skin_df['dx'].map(lesion_type_dict.get)
+skin_df['cell_type_idx'] = pd.Categorical(skin_df['cell_type']).codes
+skin_df['age'].fillna(skin_df['age'].mean(), inplace=True)
+print('Class distribution:')
+print(skin_df['cell_type'].value_counts())
+
+## Step 2 — EDA
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+colors = ['#e74c3c' if c in ['Melanoma','Basal cell carcinoma','Actinic keratoses']
+          else '#f39c12' if c == 'Vascular lesions' else '#2ecc71'
+          for c in skin_df['cell_type'].value_counts().index]
+skin_df['cell_type'].value_counts().plot(kind='bar', ax=axes[0], color=colors, edgecolor='white')
+axes[0].set_title('Class Distribution (Red=High Risk)')
+axes[0].tick_params(axis='x', rotation=35)
+skin_df['age'].hist(bins=40, ax=axes[1], color='steelblue', edgecolor='white')
+axes[1].set_title('Age Distribution')
+plt.tight_layout(); plt.savefig('eda.png', dpi=120); plt.show()
+
+## Step 3 — Preprocessing (Hair Removal + CLAHE)
+IMG_SIZE = 224
+
+def remove_hair(img):
+    try:
+        gray   = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 9))
+        bhat   = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+        _, th  = cv2.threshold(bhat, 10, 255, cv2.THRESH_BINARY)
+        return cv2.inpaint(img, th, 1, cv2.INPAINT_TELEA)
+    except: return img
+
+def apply_clahe(img):
+    try:
+        lab     = cv2.cvtColor(img, cv2.COLOR_RGB2LAB)
+        l, a, b = cv2.split(lab)
+        clahe   = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        return cv2.cvtColor(cv2.merge([clahe.apply(l), a, b]), cv2.COLOR_LAB2RGB)
+    except: return img
+
+def load_and_preprocess(path):
+    try:
+        img = np.asarray(Image.open(path).resize((IMG_SIZE, IMG_SIZE)).convert('RGB'))
+        return apply_clahe(remove_hair(img))
+    except: return np.zeros((IMG_SIZE, IMG_SIZE, 3), dtype=np.uint8)
+
+sample_paths = skin_df['path'].sample(3, random_state=42).tolist()
+fig, axes = plt.subplots(3, 3, figsize=(10, 10))
+for i, path in enumerate(sample_paths):
+    raw = np.asarray(Image.open(path).resize((IMG_SIZE, IMG_SIZE)).convert('RGB'))
+    for ax, im, t in zip(axes[i],
+                         [raw, remove_hair(raw), apply_clahe(remove_hair(raw))],
+                         ['Original', 'Hair Removed', 'CLAHE']):
+        ax.imshow(im); ax.set_title(t, fontsize=9); ax.axis('off')
+plt.suptitle('Preprocessing Pipeline', fontsize=12, fontweight='bold')
+plt.tight_layout(); plt.savefig('preprocessing.png', dpi=120); plt.show()
+
+## Step 4 — Load All Images
+print('Loading {} images with 8 threads...'.format(len(skin_df)))
+with ThreadPool(8) as pool:
+    images = pool.map(load_and_preprocess, skin_df['path'].tolist())
+skin_df['image'] = images
+print('Done! Shape:', skin_df['image'].iloc[0].shape)
+
+## Step 5 — Oversample Minority Classes
+> Increased target to 1500 for worst-performing classes (vasc, bkl, akiec).
+# Boosted targets based on v5 classification report
+# Vascular lesions F1=0.56 → boost to 2000
+# BKL F1=0.78, Melanoma F1=0.88 → boost to 1500
+boost_2000 = ['Vascular lesions']
+boost_1500 = ['Benign keratosis-like lesions', 'Melanoma']
+
+balanced = []
+for idx in sorted(skin_df['cell_type_idx'].unique()):
+    sub  = skin_df[skin_df['cell_type_idx'] == idx]
+    n    = len(sub)
+    name = sub['cell_type'].iloc[0]
+    if name in boost_2000:
+        target = 2000
+    elif name in boost_1500:
+        target = 1500
+    else:
+        target = 1000
+    if n < target:
+        times  = target // n
+        remain = target % n
+        over   = pd.concat([sub]*times + [sub.sample(remain, random_state=42)],
+                           ignore_index=True)
+        balanced.append(over)
+        print('Class {:d} ({:<35s}): {:4d} -> {:4d}'.format(idx, name, n, len(over)))
+    else:
+        balanced.append(sub)
+        print('Class {:d} ({:<35s}): {:4d} (unchanged)'.format(idx, name, n))
+
+skin_df_bal = pd.concat(balanced, ignore_index=True).sample(frac=1, random_state=42)
+print('\nBalanced total:', len(skin_df_bal))
+print(skin_df_bal['cell_type'].value_counts())
+
+## Step 6 — Split & Normalize
+features = skin_df_bal.drop(columns=['cell_type_idx'])
+target   = skin_df_bal['cell_type_idx']
+
+x_tr_o, x_test_o, y_tr_o, y_test_o = train_test_split(
+    features, target, test_size=0.20, random_state=42, stratify=target
+)
+x_train_raw = np.asarray(x_tr_o['image'].tolist()).astype('float32')
+x_test_raw  = np.asarray(x_test_o['image'].tolist()).astype('float32')
+y_train     = to_categorical(y_tr_o,   num_classes=7)
+y_test      = to_categorical(y_test_o, num_classes=7)
+
+x_train_raw, x_val_raw, y_train, y_validate = train_test_split(
+    x_train_raw, y_train, test_size=0.10, random_state=42
+)
+
+x_val_scaled  = preprocess_input(x_val_raw.copy())
+x_test_scaled = preprocess_input(x_test_raw.copy())
+
+print('Train    :', x_train_raw.shape)
+print('Validate :', x_val_raw.shape)
+print('Test     :', x_test_raw.shape)
+print('Val range: [{:.1f}, {:.1f}]'.format(x_val_scaled.min(), x_val_scaled.max()))
+
+## Step 7 — Class Weights
+cw = compute_class_weight('balanced', classes=np.unique(y_tr_o), y=y_tr_o)
+class_weight_dict = dict(enumerate(cw))
+print('Class weights:')
+for k, v in class_weight_dict.items():
+    print('  [{:d}] {:<35s}: {:.4f}'.format(k, list(lesion_type_dict.values())[k], v))
+
+## Step 8 — tf.data Pipeline with .repeat()
+BATCH_SIZE = 32
+AUTOTUNE   = tf.data.AUTOTUNE
+
+@tf.function
+def augment_fn(image, label):
+    image = tf.cast(image, tf.float32)
+    image = (image / 127.5) - 1.0          # ResNet50V2 normalization
+    image = tf.image.random_flip_left_right(image)
+    image = tf.image.random_flip_up_down(image)
+    k     = tf.random.uniform([], 0, 4, dtype=tf.int32)
+    image = tf.image.rot90(image, k=k)
+    image = tf.image.random_brightness(image, max_delta=0.15)
+    image = tf.image.random_contrast(image, lower=0.85, upper=1.15)
+    image = tf.clip_by_value(image, -1.0, 1.0)
+    return image, label
+
+# .repeat() + steps_per_epoch = guaranteed full epoch every time
+train_ds = (
+    tf.data.Dataset.from_tensor_slices((x_train_raw, y_train))
+    .shuffle(buffer_size=len(x_train_raw), seed=42, reshuffle_each_iteration=True)
+    .map(augment_fn, num_parallel_calls=AUTOTUNE)
+    .batch(BATCH_SIZE)
+    .repeat()                               # KEY FIX: never exhausts
+    .prefetch(AUTOTUNE)
+)
+
+STEPS = len(x_train_raw) // BATCH_SIZE
+print('Pipeline ready with .repeat() — no more alternating epoch bug')
+print('Steps per epoch :', STEPS)
+print('Total train imgs:', len(x_train_raw))
+
+for imgs, labels in train_ds.take(1):
+    print('Batch shape     :', imgs.shape)
+    print('Pixel range     : [{:.2f}, {:.2f}]'.format(
+        float(tf.reduce_min(imgs)), float(tf.reduce_max(imgs))))
+print('Pipeline verified OK.')
+
+## Step 9 — Build Model (ResNet50V2)
+NUM_CLASSES = 7
+INPUT_SHAPE = (IMG_SIZE, IMG_SIZE, 3)
+
+base_model = ResNet50V2(
+    weights='imagenet', include_top=False, input_shape=INPUT_SHAPE
+)
+base_model.trainable = False
+
+# Increased dropout to reduce overfitting (v5 had 8.7% train-val gap)
+x      = base_model.output
+x      = GlobalAveragePooling2D()(x)
+x      = BatchNormalization()(x)
+x      = Dropout(0.6)(x)  # increased from 0.5
+x      = Dense(512, activation='relu', kernel_regularizer=l2(2e-4))(x)  # stronger L2
+x      = BatchNormalization()(x)
+x      = Dropout(0.5)(x)  # increased from 0.4
+x      = Dense(256, activation='relu', kernel_regularizer=l2(2e-4))(x)
+x      = BatchNormalization()(x)
+x      = Dropout(0.4)(x)  # increased from 0.3
+output = Dense(NUM_CLASSES, activation='softmax')(x)
+
+model = Model(inputs=base_model.input, outputs=output)
+
+total     = int(np.sum([np.prod(w.shape) for w in model.weights]))
+trainable = int(np.sum([np.prod(w.shape) for w in model.trainable_weights]))
+print('Backbone     : ResNet50V2 (ImageNet)')
+print('Dropout      : 0.6 / 0.5 / 0.4  (increased to fight overfitting)')
+print('L2 reg       : 2e-4 (stronger than v5)')
+print('Total params : {:,}'.format(total))
+print('Trainable    : {:,} (head only — Phase 1)'.format(trainable))
+
+## Step 10 — Callbacks
+def get_callbacks(path, patience_es=12, patience_lr=5):
+    return [
+        EarlyStopping(
+            monitor='val_accuracy', patience=patience_es,
+            restore_best_weights=True, mode='max', verbose=1
+        ),
+        ReduceLROnPlateau(
+            monitor='val_loss', factor=0.5,
+            patience=patience_lr, min_lr=1e-9, verbose=1
+        ),
+        ModelCheckpoint(
+            path, monitor='val_accuracy',
+            save_best_only=True, mode='max', verbose=1
+        )
+    ]
+print('Callbacks ready.')
+
+## Step 11 — Phase 1: Train Head (30 Epochs)
+> All epochs should take equal time now — .repeat() fixes the alternating bug.
+model.compile(
+    optimizer=Adam(learning_rate=1e-3),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+print('=' * 60)
+print('PHASE 1 — Head only (ResNet50V2 frozen)')
+print('Epochs: 30 | LR: 1e-3 | Steps/epoch:', STEPS)
+print('All epochs should take same duration with .repeat()')
+print('=' * 60)
+
+history1 = model.fit(
+    train_ds,
+    epochs=30,
+    steps_per_epoch=STEPS,
+    validation_data=(x_val_scaled, y_validate),
+    class_weight=class_weight_dict,
+    callbacks=get_callbacks('best_model_p1.keras', patience_es=10, patience_lr=4),
+    verbose=1
+)
+
+k     = 'val_accuracy' if 'val_accuracy' in history1.history else 'val_acc'
+best1 = max(history1.history[k])
+print('\nPhase 1 best val_accuracy: {:.2f}%'.format(best1 * 100))
+
+## Step 12 — Phase 2: Fine-Tune (100 Epochs, Patience=15)
+> v4 was still improving at epoch 50. Extended to 100 with higher patience.
+base_model.trainable = True
+freeze_until = int(len(base_model.layers) * 0.4)
+for layer in base_model.layers[:freeze_until]:
+    layer.trainable = False
+for layer in base_model.layers[freeze_until:]:
+    layer.trainable = True
+
+trainable = int(np.sum([np.prod(w.shape) for w in model.trainable_weights]))
+print('Frozen until layer : {} / {}'.format(freeze_until, len(base_model.layers)))
+print('Trainable params   : {:,}'.format(trainable))
+
+model.compile(
+    optimizer=Adam(learning_rate=1e-5, weight_decay=1e-4),
+    loss='categorical_crossentropy',
+    metrics=['accuracy']
+)
+
+print('=' * 60)
+print('PHASE 2 — Fine-tuning (top 60% of ResNet50V2 unfrozen)')
+print('Epochs: 100 | LR: 1e-5 | Steps/epoch:', STEPS)
+print('EarlyStopping patience=15 — will stop when truly converged')
+print('=' * 60)
+
+history2 = model.fit(
+    train_ds,
+    epochs=100,
+    steps_per_epoch=STEPS,
+    validation_data=(x_val_scaled, y_validate),
+    class_weight=class_weight_dict,
+    callbacks=get_callbacks('best_model.keras', patience_es=15, patience_lr=6),
+    verbose=1
+)
+
+k     = 'val_accuracy' if 'val_accuracy' in history2.history else 'val_acc'
+best2 = max(history2.history[k])
+print('\nPhase 2 best val_accuracy: {:.2f}%'.format(best2 * 100))
+
+## Step 13 — Training Curves
+def g(h, key):
+    alt = key.replace('accuracy','acc').replace('val_accuracy','val_acc')
+    return h.history.get(key, h.history.get(alt, []))
+
+acc      = g(history1,'accuracy')     + g(history2,'accuracy')
+val_acc  = g(history1,'val_accuracy') + g(history2,'val_accuracy')
+loss     = g(history1,'loss')         + g(history2,'loss')
+val_loss = g(history1,'val_loss')     + g(history2,'val_loss')
+ep       = range(1, len(acc)+1)
+p1_end   = len(g(history1,'loss'))
+
+fig, axs = plt.subplots(1, 2, figsize=(15, 5))
+for ax, tv, vv, title in zip(axs,
+    [acc, loss], [val_acc, val_loss], ['Accuracy','Loss']):
+    ax.plot(ep, tv, label='Train',      color='#2196F3')
+    ax.plot(ep, vv, label='Validation', color='#4CAF50')
+    ax.axvline(p1_end, color='gray', linestyle='--', linewidth=1.5, label='Phase 2 start')
+    ax.set_title(title); ax.set_xlabel('Epoch')
+    ax.legend(); ax.grid(alpha=0.3)
+plt.suptitle('Training History — Phase 1 + Phase 2', fontsize=13, fontweight='bold')
+plt.tight_layout()
+plt.savefig('training_curves.png', dpi=150)
+plt.show()
+
+## Step 14 — Final Evaluation
+_, acc_v = model.evaluate(x_val_scaled,  y_validate, verbose=0)
+_, acc_t = model.evaluate(x_test_scaled, y_test,     verbose=0)
+
+print('\n' + '=' * 60)
+print('FINAL RESULTS')
+print('=' * 60)
+print('Validation Accuracy : {:.2f}%'.format(acc_v * 100))
+print('Test Accuracy       : {:.2f}%'.format(acc_t * 100))
+print('=' * 60)
+if acc_t >= 0.90:
+    print('TARGET MET: Above 90%!')
+elif acc_t >= 0.85:
+    print('Close to target — above 85%')
+else:
+    print('Share logs — will diagnose further.')
+
+## Step 15 — Confusion Matrix
+Y_pred   = model.predict(x_val_scaled, verbose=0)
+Y_pred_c = np.argmax(Y_pred,    axis=1)
+Y_true   = np.argmax(y_validate, axis=1)
+
+class_labels = list(lesion_type_dict.values())
+cm      = confusion_matrix(Y_true, Y_pred_c)
+cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+for ax, data, fmt, title in zip(
+    axes, [cm, cm_norm], ['d','.2f'],
+    ['Confusion Matrix (Counts)','Confusion Matrix (Normalized)']):
+    im = ax.imshow(data, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.set_title(title, fontsize=12); plt.colorbar(im, ax=ax)
+    ticks = np.arange(len(class_labels))
+    ax.set_xticks(ticks); ax.set_xticklabels(class_labels, rotation=40, ha='right', fontsize=8)
+    ax.set_yticks(ticks); ax.set_yticklabels(class_labels, fontsize=8)
+    thresh = data.max() / 2.
+    for i, j in itertools.product(range(data.shape[0]), range(data.shape[1])):
+        ax.text(j, i, format(data[i,j], fmt), ha='center',
+                color='white' if data[i,j] > thresh else 'black', fontsize=8)
+    ax.set_ylabel('True'); ax.set_xlabel('Predicted')
+plt.tight_layout()
+plt.savefig('confusion_matrix.png', dpi=150)
+plt.show()
+
+## Step 16 — Classification Report
+print(classification_report(Y_true, Y_pred_c, target_names=class_labels, digits=4))
+
+err = 1 - np.diag(cm) / np.sum(cm, axis=1)
+colors_b = ['#e74c3c' if e > 0.2 else '#f39c12' if e > 0.1 else '#2ecc71' for e in err]
+plt.figure(figsize=(11, 4))
+bars = plt.bar(class_labels, err, color=colors_b, edgecolor='white')
+plt.xticks(rotation=30, ha='right')
+plt.ylabel('Fraction Misclassified')
+plt.title('Per-Class Error Rate (Red>20%, Orange>10%, Green<=10%)')
+for bar, val in zip(bars, err):
+    plt.text(bar.get_x()+bar.get_width()/2, bar.get_height()+0.005,
+             '{:.1%}'.format(val), ha='center', fontsize=9)
+plt.tight_layout()
+plt.savefig('per_class_error.png', dpi=150)
+plt.show()
+
+## Step 17 — Save for Deployment
+import json
+model.save('skin_cancer_model.keras')
+print('Saved: skin_cancer_model.keras')
+
+class_info = {
+    str(i): {
+        'name': list(lesion_type_dict.values())[i],
+        'code': list(lesion_type_dict.keys())[i],
+        'risk': 'High'   if list(lesion_type_dict.keys())[i] in ['mel','bcc','akiec']
+               else 'Medium' if list(lesion_type_dict.keys())[i] == 'vasc'
+               else 'Low'
+    }
+    for i in range(7)
+}
+with open('class_info.json', 'w') as f:
+    json.dump(class_info, f, indent=2)
+print('Saved: class_info.json')
+
+config = {
+    'img_size': IMG_SIZE,
+    'num_classes': 7,
+    'backbone': 'ResNet50V2',
+    'normalization': '(image/127.5)-1.0',
+    'preprocessing': ['hair_removal', 'clahe']
+}
+with open('model_config.json', 'w') as f:
+    json.dump(config, f, indent=2)
+print('Saved: model_config.json')
+
+print('\n' + '=' * 60)
+print('TEST ACCURACY  : {:.2f}%'.format(acc_t * 100))
+print('VAL  ACCURACY  : {:.2f}%'.format(acc_v * 100))
+print('BACKBONE       : ResNet50V2')
+print('PIPELINE       : tf.data with .repeat() — no epoch bug')
+print('NORMALIZATION  : (image/127.5)-1.0')
+print('BALANCING      : Oversampling (weak classes → 1500) + weights')
+print('PREPROCESSING  : CLAHE + Hair removal')
+print('=' * 60)
+print('\nDownload from Kaggle Output tab:')
+print('  skin_cancer_model.keras  class_info.json  model_config.json')
